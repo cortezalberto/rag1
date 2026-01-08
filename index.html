@@ -1,0 +1,205 @@
+<!doctype html>
+<html lang="es">
+<head>
+    <meta charset="utf-8"/>
+    <meta name="viewport" content="width=device-width,initial-scale=1"/>
+    <title>Menu Chatbot MVP (RAG)</title>
+    <style>
+        body { font-family: system-ui, sans-serif; margin: 16px; max-width: 1100px; background-color: #f9f9f9; color: #333; }
+        h1 { color: #2c3e50; }
+        
+        select, textarea, input { width: 100%; padding: 10px; box-sizing: border-box; border: 1px solid #ccc; border-radius: 5px; margin-top: 5px; font-size: 14px;}
+        textarea { min-height: 90px; font-family: inherit; resize: vertical; }
+        
+        button { 
+            padding: 10px 18px; cursor: pointer; background-color: #007bff; color: white; border: none; border-radius: 5px; font-weight: bold; margin-right: 5px; margin-bottom: 5px;
+            transition: background 0.2s;
+        }
+        button:hover { background-color: #0056b3; }
+        button:disabled { background-color: #ccc; cursor: not-allowed; }
+
+        .row { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+        
+        .card { border: 1px solid #ddd; border-radius: 10px; padding: 15px; margin-top: 12px; background-color: white; box-shadow: 0 2px 4px rgba(0,0,0,0.05); }
+        .card h2 { margin-top: 0; font-size: 1.2rem; color: #444; border-bottom: 2px solid #eee; padding-bottom: 8px;}
+        
+        .muted { color:#666; font-size: 13px; margin-top: 5px; display: block; }
+        pre { white-space: pre-wrap; word-break: break-word; font-family: inherit; background: #f4f4f4; padding: 10px; border-radius: 5px; border: 1px solid #e0e0e0; }
+        
+        .source-item { margin-bottom: 12px; border-bottom: 1px solid #eee; padding-bottom: 8px; }
+        .source-header { font-weight: bold; color: #007bff; font-size: 13px; }
+        .score-badge { background: #eef; color: #005; padding: 2px 6px; border-radius: 4px; font-size: 11px; margin-left: 5px; }
+
+        /* Loading Spinner */
+        .loading::after { content: ' ⏳'; }
+    </style>
+</head>
+<body>
+
+    <h1>🥘 Menu Chatbot MVP (RAG)</h1>
+    <p class="muted">1) Seed 10 platos → 2) Index embeddings → 3) Preguntá. Verás respuesta + chunks usados.</p>
+
+    <!-- Panel de Control -->
+    <div class="card">
+        <div style="display:flex; gap:10px; flex-wrap: wrap;">
+            <button onclick="seed()">1) Seed Cargar Platos</button>
+            <button onclick="indexEmb()">2) Index Embeddings</button>
+            <button onclick="loadDishes()">🔄 Actualizar Lista</button>
+            <button onclick="health()" style="background-color: #28a745;">Health Check</button>
+        </div>
+        <div id="status" class="muted" style="margin-top:10px; padding: 10px; background: #eee; border-radius: 4px;">Listo para empezar.</div>
+    </div>
+
+    <!-- Chat -->
+    <div class="row">
+        <!-- Columna Izquierda: Input -->
+        <div class="card">
+            <h2>💬 Consulta</h2>
+            
+            <label class="muted">Plato (opcional, filtra la búsqueda al menú seleccionado):</label>
+            <select id="dish">
+                <option value="">(Buscando en todo el menú...)</option>
+            </select>
+
+            <label class="muted" style="margin-top:15px; display:block;">Tu pregunta:</label>
+            <textarea id="q" placeholder="Ej: ¿Tiene lácteos? ¿Es picante? ¿Se puede pedir sin maní?"></textarea>
+            
+            <button onclick="ask()" id="btnAsk" style="width: 100%; margin-top: 10px; font-size: 16px; padding: 12px;">Enviar Pregunta</button>
+        </div>
+
+        <!-- Columna Derecha: Respuesta -->
+        <div class="card">
+            <h2>🤖 Respuesta del Bot</h2>
+            <pre id="answer" style="min-height: 150px;">La respuesta aparecerá aquí...</pre>
+            
+            <div id="meta" class="muted" style="margin-top: 10px; border-top: 1px dashed #ccc; padding-top: 10px;">
+                Decision: - | Confianza: - | ID: -
+            </div>
+        </div>
+    </div>
+
+    <!-- Fuentes -->
+    <div class="card">
+        <h2>📄 Fuentes (Chunks recuperados)</h2>
+        <div id="sources" class="muted">—</div>
+    </div>
+
+    <script>
+        const API = "http://localhost:8002";
+
+        // --- Utilidades ---
+        function setStatus(t, isError = false){ 
+            const el = document.getElementById("status");
+            el.textContent = t; 
+            el.style.color = isError ? "red" : "#333";
+        }
+        function escapeHtml(s){
+            return String(s).replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;");
+        }
+
+        // --- Acciones ---
+
+        async function health() {
+            setStatus("Verificando sistema...");
+            try {
+                const r = await fetch(`${API}/health`);
+                const d = await r.json();
+                const ollamaStatus = d.ollama_reachable ? "✅ Conectado" : "❌ Desconectado (Revisa Ollama)";
+                setStatus(`DB: ${d.dishes} platos | Embeddings: ${d.embeddings} | Ollama: ${ollamaStatus}`);
+            } catch (e) {
+                setStatus("Error: No puedo conectar con el Backend. ¿Está corriendo 'uvicorn'?", true);
+            }
+        }
+
+        async function seed() {
+            setStatus("Cargando 10 platos...");
+            try {
+                const r = await fetch(`${API}/seed`, {method:"POST"});
+                const d = await r.json();
+                setStatus(d.message);
+                await loadDishes(); // Refrescar el dropdown
+            } catch (e) { setStatus("Error en Seed.", true); }
+        }
+
+        async function indexEmb() {
+            setStatus("Indexando embeddings... (esto puede tardar unos segundos)");
+            const btn = event.target;
+            btn.classList.add('loading');
+            try {
+                const r = await fetch(`${API}/index`, {method:"POST"});
+                const d = await r.json();
+                setStatus(d.message);
+            } catch (e) { setStatus("Error en Index.", true); }
+            finally { btn.classList.remove('loading'); }
+        }
+
+        async function loadDishes() {
+            try {
+                const r = await fetch(`${API}/dishes`);
+                const dishes = await r.json();
+                const sel = document.getElementById("dish");
+                sel.innerHTML = `<option value="">(Buscando en todo el menú...)</option>` + dishes.map(d =>
+                    `<option value="${d.id}">${escapeHtml(d.name)}</option>`
+                ).join("");
+            } catch (e) { console.log("No se pudieron cargar platos"); }
+        }
+
+        async function ask() {
+            const q = document.getElementById("q").value.trim();
+            const dishId = document.getElementById("dish").value || null;
+            if (!q) return alert("Por favor escribí una pregunta.");
+
+            // UI Loading state
+            document.getElementById("answer").textContent = "Pensando...";
+            document.getElementById("sources").textContent = "Buscando en la base de conocimientos...";
+            document.getElementById("btnAsk").disabled = true;
+            document.getElementById("meta").textContent = "";
+
+            try {
+                const payload = {question: q, top_k: 6};
+                if (dishId) payload.dish_id = Number(dishId);
+
+                const r = await fetch(`${API}/chat`, {
+                    method:"POST",
+                    headers: {"Content-Type": "application/json"},
+                    body: JSON.stringify(payload)
+                });
+                const d = await r.json();
+
+                if (!r.ok) throw new Error(d.detail || "Error desconocido");
+
+                // Renderizar respuesta
+                document.getElementById("answer").textContent = d.answer;
+                
+                // Renderizar metadatos
+                const confColor = d.confidence > 0.8 ? "green" : (d.confidence > 0.5 ? "orange" : "red");
+                document.getElementById("meta").innerHTML = 
+                    `Decisión: <b>${d.decision}</b> | 
+                    Confianza: <span style="color:${confColor}">${Number(d.confidence).toFixed(3)}</span> | 
+                    trace_id: ${d.trace_id}`;
+
+                // Renderizar fuentes
+                if (d.sources && d.sources.length) {
+                    document.getElementById("sources").innerHTML = d.sources.map(s => `
+                        <div class="source-item">
+                            <div class="source-header">chunk:${s.chunk_id} <span class="score-badge">score ${Number(s.score).toFixed(3)}</span></div>
+                            <div class="muted">${escapeHtml(s.preview)}</div>
+                        </div>
+                    `).join("");
+                } else {
+                    document.getElementById("sources").textContent = "No se encontraron fuentes relevantes.";
+                }
+
+            } catch (e) {
+                document.getElementById("answer").textContent = "Error: " + e.message;
+                setStatus("Ocurrió un error al procesar la pregunta.", true);
+            } finally {
+                document.getElementById("btnAsk").disabled = false;
+            }
+        }
+
+        // Iniciar
+        loadDishes();
+    </script>
+</body>
+</html>
