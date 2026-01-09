@@ -1,0 +1,1751 @@
+A continuación te hago un análisis profundo del RAG aplicado al dominio restaurante tal como está planteado en el documento, pero “pensado en producción” (operación real, riesgo alimentario, multi-sucursal, rendimiento, trazabilidad y evolución). 
+RAG-Restaurante-Arquitectura-de…
+________________________________________
+1) Qué está bien resuelto (y por qué es correcto para restaurante)
+Refactor arquitectónico: de “demo” a “producto”
+El documento parte de un problema clásico: un monolito (575 líneas) con endpoints + modelos + lógica mezclados, imposible de testear y de evolucionar (pág. 2–4). La propuesta de capas (API / services / repositories / models) está bien alineada con un sistema que va a crecer (pág. 4–5). En restaurante, esto es clave porque el alcance se expande rápido: menús por sucursal, alérgenos, disponibilidad, promociones, horarios, “sin sal / sin ajo”, etc.
+Pipeline RAG completo, con trazabilidad explícita
+La secuencia de ChatService (normalizar → detectar alergias → registrar turno → embedding → retrieval → prompts → respuesta → traza) es muy buena como “columna vertebral” (pág. 19). El agregado de ChatTurn + RagTrace como entidades separadas (pág. 10–11) es especialmente valioso en dominios con riesgo: permite auditar qué evidencia sustentó cada respuesta y ajustar umbrales / prompts con datos.
+Seguridad alimentaria como requisito de diseño, no “parche”
+El sistema distingue tipos de decisión (ANSWER / SOFT_DISCLAIMER / DISCLAIMER) y define umbrales (0.78 / 0.60) (pág. 7 y 18). Además, detecta “consultas sensibles” por triggers de alergia (34 términos) y activa modo conservador (pág. 7, 16, 31). Para restaurante esto está bien: es preferible negar o advertir antes que inventar.
+Elección tecnológica coherente: Postgres + pgvector + HNSW
+Guardar chunks y embeddings en Postgres y buscar por similitud coseno con HNSW es una opción pragmática para un restaurante o cadena mediana (pág. 9, 13, 32, 34). Es simple de operar, consistente transaccionalmente y fácil de desplegar con Docker.
+________________________________________
+2) El “corazón” del sistema: chunking + retrieval + umbrales (lo crítico)
+Chunking por caracteres (1200/200): suficiente para MVP, riesgoso para precisión fina
+El documento propone chunking fijo por caracteres (1200 con overlap 200) (pág. 16, 34). Esto funciona, pero en restaurante la precisión depende de micro-hechos: “contiene salsa de soja”, “caldo de pollo”, “trazas de gluten”, “se fríe en el mismo aceite”, etc.
+Riesgo: si un chunk mezcla “ingredientes” con “variantes” o “advertencias”, el modelo puede responder ambiguo.
+Mejora recomendada (sin cambiar toda la arquitectura):
+•	Chunking por secciones semánticas de una ficha: ingredientes, alérgenos, trazas, técnicas, opciones de reemplazo, observaciones del chef.
+•	Guardar en metadata_json campos como: section, version, branch_id, language, last_updated, contains_allergen=[...].
+•	Overlap basado en frases / bullets más que caracteres.
+Retrieval: “top-k + score = 1 - distance”
+La conversión de distancia a score (score = max(0, 1-distance)) (pág. 13) es útil, pero en práctica:
+•	No todos los modelos tienen distancias “calibradas” igual.
+•	Un score alto puede venir de “texto similar” pero no de la parte correcta (“sin TACC” en un lado y “contiene harina” en otro).
+Mejora clave: introducir un re-ranking liviano (puede ser LLM-based o heurístico) para “alérgenos/ingredientes”:
+•	Paso 1: vector search top-k (rápido).
+•	Paso 2: re-rank por reglas: priorizar chunks con section=allergens|ingredients, o que contengan el alérgeno consultado, o que pertenezcan al plato correcto.
+•	Paso 3: solo ahí calcular la confianza final.
+Umbrales globales: bien como base, pero faltan “umbrales por tipo de pregunta”
+El documento usa umbrales fijos y eleva para alergias en el ejemplo (pág. 20). Eso está genial como idea, pero en restaurante hay más clases “sensibles” además de alergias:
+•	Alergias (alto riesgo físico)
+•	Sin TACC / celiaquía (altísimo riesgo)
+•	Vegano/vegetariano (riesgo ético + reputacional)
+•	Picante (bajo riesgo, alta subjetividad)
+•	Calorías/macros (si no hay fuente, alto riesgo reputacional)
+•	Disponibilidad (riesgo operativo: “me lo pedí y no hay”)
+Mejora: “policy de riesgo” por intención:
+•	allergens → umbral alto + respuesta estructurada + verificación obligatoria.
+•	dietary_tags → umbral medio + advertencia si hay trazas/contaminación cruzada.
+•	recommendations → umbral más bajo (porque es subjetivo) + estilo conversacional.
+•	availability → NO se resuelve con RAG: debería consultar el core transaccional (stock/estado).
+________________________________________
+3) Dominio restaurante real: lo que falta para que sea “multi-sucursal” y operable
+Tu documento modela dish, kb_chunk, kb_embedding, chat_turn, rag_trace (pág. 11). Para un restaurante real (sobre todo multi-sucursal/tenant), faltan campos de scope:
+Multi-tenant / multi-branch (imprescindible en tu caso)
+Hoy la arquitectura describe un sistema genérico de menú; pero tu caso real suele ser:
+•	Tenant (restaurante) con múltiples sucursales
+•	Menú puede variar por sucursal (platos, precios, disponibilidad, ingredientes por proveedor)
+Extensión mínima recomendada:
+•	tenant_id, branch_id en dish, kb_chunk, chat_turn, rag_trace.
+•	Filtrado obligatorio en retrieval: “buscar embeddings solo del branch actual”.
+•	En API: el contexto branch_id debería venir del QR / sesión / token de mesa.
+Sin esto, el RAG puede mezclar evidencia de otra sucursal y responder mal (por ejemplo “sin TACC” en una sucursal pero no en otra por cambios de cocina/proveedor).
+Versionado y vigencia: menú cambia semanalmente
+El documento menciona trazabilidad, pero no “vigencia” del conocimiento. En restaurante esto es crítico:
+•	Cambian ingredientes por proveedor.
+•	Cambia la carta (temporada).
+•	Cambia la receta.
+Mejora:
+•	effective_from, effective_to o al menos updated_at + menu_version.
+•	En retrieval: priorizar chunks más recientes.
+•	En respuesta: si el chunk es viejo, forzar SOFT_DISCLAIMER.
+________________________________________
+4) Prompting: correcto, pero falta “formato de respuesta” para seguridad
+El PromptService arma system prompt + user prompt + soft disclaimer (pág. 17). Bien. Pero para minimizar riesgo en alergias, no alcanza con un disclaimer textual.
+Recomendación fuerte: respuestas estructuradas (aunque el frontend luego las “narre”):
+•	answer_text
+•	dish_identified (sí/no + id)
+•	allergens_found (lista)
+•	uncertainties (lista: “no hay evidencia sobre contaminación cruzada”)
+•	sources (chunks + score)
+•	action: ASK_STAFF | SAFE_TO_ORDER | NEEDS_VERIFICATION
+Esto alinea seguridad, UX y auditoría.
+________________________________________
+5) Observabilidad y mejora continua: ya tenés la base, falta explotar los datos
+El documento acierta al registrar trazas (pág. 10 y 19). Eso permite cerrar el loop:
+•	¿Qué preguntas disparan DISCLAIMER?
+•	¿Qué platos tienen evidencia pobre?
+•	¿Qué chunks se usan más y fallan?
+•	¿Qué sucursal tiene más “incertidumbre”?
+Siguiente paso natural:
+•	Métricas por día: tasa de ANSWER vs SOFT vs DISCLAIMER
+•	“Top gaps”: preguntas frecuentes sin evidencia
+•	Drift: cuando cambias el modelo de embeddings (pág. 36) comparar antes/después
+________________________________________
+6) Integración con el “core” del restaurante (lo más importante en producto)
+El documento está bien como sistema de consultas de menú, pero un restaurante real tiene 2 mundos:
+1.	Core transaccional: pedidos, rondas, cocina, pagos, disponibilidad, tiempos.
+2.	RAG informativo: ingredientes, descripción, recomendaciones, historia del plato, etc.
+Tu documento está en el (2). Lo correcto es mantenerlo separado. Si lo mezclás, un fallo del RAG puede afectar pedidos/pagos.
+Regla de oro:
+•	RAG responde “información del menú”.
+•	Todo lo que sea “estado” (disponible, demora, promociones activas, precio actual por sucursal) debe venir del core vía API.
+________________________________________
+7) Riesgos actuales y ajustes prioritarios (ordenados por impacto)
+1.	Falta scope tenant/sucursal → riesgo de mezclar evidencia entre sucursales.
+2.	Chunking por caracteres → puede partir o mezclar información sensible.
+3.	Umbrales únicos → deberían variar por intención/riesgo, no solo por “trigger de alergia”.
+4.	Sin vigencia/versionado → respuestas “correctas pero desactualizadas”.
+5.	Respuesta no estructurada → difícil asegurar comportamiento en UX y auditoría.
+________________________________________
+8) En qué nivel está hoy (mi diagnóstico)
+•	Como documento de arquitectura, está muy bien: modularidad, SOLID, repositorios, DI, trazabilidad, umbrales y despliegue están claros (pág. 4–6, 12–22, 32–34).
+•	Como sistema “listo para restaurante real multi-sucursal”, necesita las extensiones de contexto (tenant/branch), gobernanza del conocimiento (versionado/vigencia) y política de riesgo por intención.
+________________________________________
+Si querés, en el próximo paso te lo convierto en una versión “v2 producción” (sin reescribir todo):
+•	esquema de DB actualizado (tenant/branch/version),
+•	filtros de retrieval por contexto,
+•	políticas de riesgo por tipo de pregunta,
+•	y formato de respuesta estructurado para el frontend del menú QR. 
+RAG-Restaurante-Arquitectura-de…
+Fuentes
+realiza v2 producción
+Perfecto. Te dejo una V2 “producción” para RAG de restaurante, manteniendo tu arquitectura (FastAPI + Postgres/pgvector + capas) pero agregando lo imprescindible para multi-tenant / multi-sucursal, gobernanza del conocimiento, riesgo alimentario, respuestas estructuradas, y operación real.
+________________________________________
+0) Objetivo V2 (qué cambia vs V1)
+1.	Scope obligatorio: tenant_id + branch_id en todo lo que toca menú/RAG.
+2.	KB gobernada: documentos versionados, vigencia, estado (draft/published), auditoría.
+3.	Chunking semántico: por secciones del plato (ingredientes/alérgenos/trazas/etc.).
+4.	Retrieval con filtros + re-rank: primero pgvector, después reglas (alérgenos/ingredientes).
+5.	Policy de riesgo por intención: umbrales y comportamiento por tipo de pregunta.
+6.	Respuesta estructurada: para UX segura (mostrar “verificar con mozo” cuando corresponde).
+7.	Separación Core vs RAG: disponibilidad/precio/tiempo real vienen del core transaccional.
+________________________________________
+1) Modelo de datos V2 (Postgres)
+1.1 Entidades nuevas / ampliadas
+tenants / branches
+•	tenant(id, name, slug, settings_json, created_at)
+•	branch(id, tenant_id, name, slug, timezone, address, settings_json, created_at)
+dishes (plato)
+•	dish(id, tenant_id, branch_id, code, name, description, tags_json, is_active, updated_at)
+•	Nota: branch_id porque el plato puede variar por sucursal (o estar “global” si branch_id NULL + reglas).
+kb_document (documento fuente)
+Representa “la ficha de carta”, “notas del chef”, “alérgenos oficiales”, “FAQ”, etc.
+•	kb_document(id, tenant_id, branch_id, type, title, source_uri, source_hash, status, version, effective_from, effective_to, created_at, updated_at)
+o	type: MENU_CARD | CHEF_NOTES | ALLERGEN_SHEET | FAQ | GLOSSARY
+o	status: DRAFT | PUBLISHED | ARCHIVED
+o	version: incremental o semver
+o	effective_from/to: vigencia
+kb_chunk (chunk semántico)
+•	kb_chunk(id, tenant_id, branch_id, document_id, dish_id nullable, section, lang, text, tokens_est, metadata_json, created_at)
+o	section: TITLE | DESCRIPTION | INGREDIENTS | ALLERGENS | TRACES | TECHNIQUE | SUBSTITUTIONS | PAIRING | FAQ | GLOSSARY
+o	metadata_json recomendado:
+	allergens_explicit: ["gluten","nuts"]
+	dietary_tags: ["vegan","sin_tacc"]
+	contains_may_contain: ["gluten"]
+	menu_version, updated_by, etc.
+kb_embedding
+•	kb_embedding(chunk_id PK/FK, tenant_id, branch_id, model, dim, embedding vector, created_at)
+•	Índice: HNSW (cosine) + partición lógica por tenant/branch si hace falta.
+chat_turn / rag_trace (como ya tenías, pero con scope y estructura)
+•	chat_turn(id, tenant_id, branch_id, session_id, actor_role, user_text, normalized_text, intent, risk_level, created_at)
+•	rag_trace(id, chat_turn_id, tenant_id, branch_id, policy_id, retrieval_k, candidates_json, selected_json, final_score, decision, answer_json, created_at)
+________________________________________
+2) Contratos (request/response) V2
+2.1 Contexto obligatorio en cada consulta
+El frontend (menú QR) SIEMPRE manda:
+•	tenant_slug
+•	branch_slug
+•	table_token/session_id (si aplica)
+•	user_role (customer/waiter/kitchen) si querés personalizar.
+2.2 Respuesta estructurada (clave de producción)
+Ejemplo AnswerEnvelope:
+{
+  "decision": "ANSWER | SOFT_DISCLAIMER | DISCLAIMER | ASK_CLARIFY",
+  "intent": "ALLERGENS | INGREDIENTS | RECOMMENDATION | DIETARY | GLOSSARY | GENERAL",
+  "risk_level": "LOW | MEDIUM | HIGH | CRITICAL",
+  "dish": {"id": 123, "name": "Burrata...", "confidence": 0.86},
+  "answer_text": "…",
+  "allergens": {
+    "explicit": ["lactosa"],
+    "may_contain": ["gluten"],
+    "unknown": ["trazas"]
+  },
+  "uncertainties": [
+    "No hay evidencia sobre contaminación cruzada en la cocina."
+  ],
+  "action": "SAFE_TO_ORDER | VERIFY_WITH_STAFF | ASK_FOR_DISH | NONE",
+  "sources": [
+    {"chunk_id": 991, "section": "ALLERGENS", "score": 0.84},
+    {"chunk_id": 1001, "section": "INGREDIENTS", "score": 0.80}
+  ],
+  "policy": {"id": "rag-policy-v2", "threshold": 0.82}
+}
+Esto te permite UX segura: si action=VERIFY_WITH_STAFF, la app lo muestra como “Confirmá con el mozo”.
+________________________________________
+3) Policy de riesgo V2 (por intención)
+3.1 Clasificación de intención (router)
+Intenciones mínimas:
+•	ALLERGENS (alergias / sin tacc / celiaquía)
+•	INGREDIENTS
+•	DIETARY (vegano/vegetariano/keto/etc.)
+•	RECOMMENDATION (liviano, picante, maridaje)
+•	GLOSSARY (nombres glamorosos)
+•	GENERAL (qué es este plato)
+•	AVAILABILITY (¿hay?, ¿queda?) → NO RAG: core.
+3.2 Umbrales recomendados
+•	ALLERGENS / SIN_TACC: 0.85 (CRITICAL) + respuesta estructurada + si falta evidencia => DISCLAIMER + “verificar”.
+•	DIETARY: 0.75 (HIGH) + si “trazas” desconocidas => SOFT_DISCLAIMER.
+•	INGREDIENTS: 0.72 (MEDIUM) + si no identifica plato => ASK_CLARIFY.
+•	RECOMMENDATION: 0.60 (LOW) + se permite conversación.
+•	GLOSSARY: 0.65
+3.3 Reglas duras (guardrails)
+•	Si el usuario menciona un alérgeno específico (“maní”, “gluten”, “mariscos”) y no hay chunk ALLERGENS/TRACES del plato con score suficiente → NO inventar: DISCLAIMER.
+•	Si el plato no se identifica con confianza → ASK_CLARIFY (mostrar lista de platos sugeridos).
+________________________________________
+4) Chunking V2 (semántico)
+En vez de “1200 chars fijo”, la ficha se ingesta como unidades:
+•	TITLE
+•	DESCRIPTION
+•	INGREDIENTS
+•	ALLERGENS
+•	TRACES
+•	SUBSTITUTIONS
+•	TECHNIQUE
+•	PAIRING
+•	FAQ
+•	GLOSSARY
+Beneficio: cuando preguntan por alergias, el retrieval se enfoca en ALLERGENS/TRACES y sube muchísimo la precisión.
+________________________________________
+5) Retrieval V2 (pgvector + re-rank)
+5.1 Paso 1: vector search con filtros
+Filtros obligatorios:
+•	tenant_id, branch_id
+•	document.status = PUBLISHED
+•	effective_from/to vigente
+•	(opcional) dish_id si ya se identificó el plato.
+5.2 Paso 2: re-ranking por reglas (barato y efectivo)
+Subir ranking si:
+•	section in (ALLERGENS, TRACES, INGREDIENTS) cuando intent = ALLERGENS/INGREDIENTS
+•	chunk.metadata_json contiene el alérgeno consultado
+•	dish_id coincide exacto
+5.3 Paso 3: score final + decisión
+•	score_final = combinación (vector_score * 0.7 + rule_bonus * 0.3)
+•	aplicar umbral por intención
+________________________________________
+6) Prompts V2 (orientados a seguridad)
+6.1 System prompt por intención (plantilla)
+•	ALLERGENS: “No supongas. Si falta evidencia explícita, declara incertidumbre y pide verificación.”
+•	RECOMMENDATION: “Sé conversacional y sugiere opciones según preferencias.”
+•	GLOSSARY: “Traduce a términos simples, sin inventar ingredientes.”
+6.2 User prompt con “context pack”
+Incluye siempre:
+•	branch_name, menu_version, dish candidate(s), retrieved chunks (con section)
+•	“Responde en JSON con el esquema AnswerEnvelope”
+________________________________________
+7) Endpoints V2 (FastAPI)
+7.1 KB / Ingesta (backoffice)
+•	POST /v2/admin/kb/documents (crear doc, status DRAFT)
+•	POST /v2/admin/kb/documents/{id}/publish
+•	POST /v2/admin/kb/documents/{id}/ingest (extraer + chunking semántico + embeddings)
+•	GET /v2/admin/kb/health (conteo chunks, modelos, última ingesta)
+7.2 Chat / Query
+•	POST /v2/rag/query
+o	input: {tenant_slug, branch_slug, session_id, user_text, user_role}
+o	output: AnswerEnvelope
+7.3 Identificación de plato (si querés separado)
+•	POST /v2/rag/dish/resolve
+o	para sugerir top platos y pedir confirmación
+________________________________________
+8) Operación real (lo que te evita incidentes)
+8.1 Gobernanza
+•	Solo PUBLISHED entra al retrieval.
+•	Versionado: si se actualiza una ficha, se crea kb_document v+1.
+•	Política: si documento expira (effective_to) queda fuera.
+8.2 Observabilidad
+Métricas base:
+•	% ANSWER vs SOFT vs DISCLAIMER
+•	top intents
+•	top platos con DISCLAIMER
+•	drift por cambio de modelo embeddings
+8.3 Fallback seguro
+Si falla embeddings o DB:
+•	para ALLERGENS: devolver DISCLAIMER fijo + “consultar al mozo”
+•	para RECOMMENDATION: fallback a texto general (“¿preferís liviano/picante?”)
+________________________________________
+9) Separación Core vs RAG (regla de producción)
+•	AVAILABILITY, PRICE, PROMOS, ETA/tiempo cocina → core transaccional.
+•	El RAG puede explicar platos, ingredientes, alérgenos, recomendaciones, traducción de nombres.
+Esto evita que el chatbot diga “sí hay” cuando en cocina no hay.
+________________________________________
+10) Checklist “go-live” (mínimo viable seguro)
+1.	tenant/branch en toda tabla y en toda query.
+2.	status=PUBLISHED + vigencia.
+3.	chunking semántico + metadata de alérgenos.
+4.	policy por intención (umbral alto en alergias).
+5.	respuesta estructurada (action=VERIFY_WITH_STAFF).
+6.	trazas completas (chunks usados + scores + policy_id).
+________________________________________
+Si querés, en el próximo mensaje te lo bajo a DDL SQL completo + modelos SQLAlchemy + endpoints FastAPI reales (con filtros tenant/branch, publish/vigencia, re-rank, y AnswerEnvelope).
+si
+Genial. Acá tenés la V2 producción bajada a DDL PostgreSQL + SQLAlchemy 2.0 + FastAPI (endpoints reales), con:
+•	multi-tenant + multi-sucursal (scope obligatorio)
+•	documentos KB versionados + publish/vigencia
+•	chunking semántico (secciones)
+•	embeddings pgvector + HNSW
+•	retrieval con filtros + re-rank por reglas
+•	policy por intención + respuesta estructurada (AnswerEnvelope)
+•	trazabilidad (chat_turn + rag_trace)
+Asumo stack: FastAPI + SQLAlchemy 2.0 + asyncpg/psycopg y PostgreSQL con pgvector.
+________________________________________
+1) DDL PostgreSQL (V2)
+-- 1) Extensiones
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+
+-- 2) Enums
+DO $$ BEGIN
+  CREATE TYPE kb_doc_status AS ENUM ('DRAFT','PUBLISHED','ARCHIVED');
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+
+DO $$ BEGIN
+  CREATE TYPE kb_doc_type AS ENUM ('MENU_CARD','CHEF_NOTES','ALLERGEN_SHEET','FAQ','GLOSSARY');
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+
+DO $$ BEGIN
+  CREATE TYPE kb_section AS ENUM (
+    'TITLE','DESCRIPTION','INGREDIENTS','ALLERGENS','TRACES','TECHNIQUE','SUBSTITUTIONS','PAIRING','FAQ','GLOSSARY'
+  );
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+
+DO $$ BEGIN
+  CREATE TYPE rag_intent AS ENUM ('ALLERGENS','INGREDIENTS','DIETARY','RECOMMENDATION','GLOSSARY','GENERAL','AVAILABILITY','UNKNOWN');
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+
+DO $$ BEGIN
+  CREATE TYPE rag_decision AS ENUM ('ANSWER','SOFT_DISCLAIMER','DISCLAIMER','ASK_CLARIFY');
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+
+DO $$ BEGIN
+  CREATE TYPE rag_risk AS ENUM ('LOW','MEDIUM','HIGH','CRITICAL');
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+
+-- 3) Tenants / Branches
+CREATE TABLE IF NOT EXISTS tenant (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  name text NOT NULL,
+  slug text NOT NULL UNIQUE,
+  settings_json jsonb NOT NULL DEFAULT '{}'::jsonb,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS branch (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id uuid NOT NULL REFERENCES tenant(id) ON DELETE CASCADE,
+  name text NOT NULL,
+  slug text NOT NULL,
+  timezone text NOT NULL DEFAULT 'America/Argentina/Mendoza',
+  address text,
+  settings_json jsonb NOT NULL DEFAULT '{}'::jsonb,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (tenant_id, slug)
+);
+
+-- 4) Dishes (por sucursal; si querés global, branch_id nullable)
+CREATE TABLE IF NOT EXISTS dish (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id uuid NOT NULL REFERENCES tenant(id) ON DELETE CASCADE,
+  branch_id uuid NOT NULL REFERENCES branch(id) ON DELETE CASCADE,
+  code text,
+  name text NOT NULL,
+  description text,
+  tags_json jsonb NOT NULL DEFAULT '[]'::jsonb,
+  is_active boolean NOT NULL DEFAULT true,
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (tenant_id, branch_id, name)
+);
+
+-- 5) KB Documents (versionados + vigencia + status)
+CREATE TABLE IF NOT EXISTS kb_document (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id uuid NOT NULL REFERENCES tenant(id) ON DELETE CASCADE,
+  branch_id uuid NOT NULL REFERENCES branch(id) ON DELETE CASCADE,
+  type kb_doc_type NOT NULL,
+  title text NOT NULL,
+  source_uri text,
+  source_hash text,
+  status kb_doc_status NOT NULL DEFAULT 'DRAFT',
+  version int NOT NULL DEFAULT 1,
+  effective_from timestamptz NOT NULL DEFAULT now(),
+  effective_to timestamptz,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (tenant_id, branch_id, type, title, version)
+);
+
+CREATE INDEX IF NOT EXISTS ix_kb_document_scope_status
+ON kb_document (tenant_id, branch_id, status, effective_from, effective_to);
+
+-- 6) KB Chunks (semánticos)
+CREATE TABLE IF NOT EXISTS kb_chunk (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id uuid NOT NULL REFERENCES tenant(id) ON DELETE CASCADE,
+  branch_id uuid NOT NULL REFERENCES branch(id) ON DELETE CASCADE,
+  document_id uuid NOT NULL REFERENCES kb_document(id) ON DELETE CASCADE,
+  dish_id uuid REFERENCES dish(id) ON DELETE SET NULL,
+  section kb_section NOT NULL,
+  lang text NOT NULL DEFAULT 'es',
+  text text NOT NULL,
+  tokens_est int NOT NULL DEFAULT 0,
+  metadata_json jsonb NOT NULL DEFAULT '{}'::jsonb,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS ix_kb_chunk_scope_doc
+ON kb_chunk (tenant_id, branch_id, document_id, section);
+
+CREATE INDEX IF NOT EXISTS ix_kb_chunk_dish
+ON kb_chunk (dish_id);
+
+-- 7) Embeddings
+-- Ajustá la dimensión (ej. 768, 1024, 1536) según tu modelo.
+CREATE TABLE IF NOT EXISTS kb_embedding (
+  chunk_id uuid PRIMARY KEY REFERENCES kb_chunk(id) ON DELETE CASCADE,
+  tenant_id uuid NOT NULL REFERENCES tenant(id) ON DELETE CASCADE,
+  branch_id uuid NOT NULL REFERENCES branch(id) ON DELETE CASCADE,
+  model text NOT NULL,
+  dim int NOT NULL,
+  embedding vector(1536) NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+-- Índice HNSW para cosine
+CREATE INDEX IF NOT EXISTS ix_kb_embedding_hnsw
+ON kb_embedding USING hnsw (embedding vector_cosine_ops);
+
+CREATE INDEX IF NOT EXISTS ix_kb_embedding_scope
+ON kb_embedding (tenant_id, branch_id, model);
+
+-- 8) Chat + Trace
+CREATE TABLE IF NOT EXISTS chat_turn (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id uuid NOT NULL REFERENCES tenant(id) ON DELETE CASCADE,
+  branch_id uuid NOT NULL REFERENCES branch(id) ON DELETE CASCADE,
+  session_id text NOT NULL,
+  actor_role text NOT NULL DEFAULT 'customer',
+  user_text text NOT NULL,
+  normalized_text text NOT NULL,
+  intent rag_intent NOT NULL DEFAULT 'UNKNOWN',
+  risk_level rag_risk NOT NULL DEFAULT 'LOW',
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS ix_chat_turn_scope_session
+ON chat_turn (tenant_id, branch_id, session_id, created_at);
+
+CREATE TABLE IF NOT EXISTS rag_trace (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  chat_turn_id uuid NOT NULL REFERENCES chat_turn(id) ON DELETE CASCADE,
+  tenant_id uuid NOT NULL REFERENCES tenant(id) ON DELETE CASCADE,
+  branch_id uuid NOT NULL REFERENCES branch(id) ON DELETE CASCADE,
+  policy_id text NOT NULL,
+  retrieval_k int NOT NULL DEFAULT 8,
+  candidates_json jsonb NOT NULL DEFAULT '[]'::jsonb,
+  selected_json jsonb NOT NULL DEFAULT '[]'::jsonb,
+  final_score double precision NOT NULL DEFAULT 0,
+  decision rag_decision NOT NULL,
+  answer_json jsonb NOT NULL DEFAULT '{}'::jsonb,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS ix_rag_trace_turn
+ON rag_trace (chat_turn_id);
+________________________________________
+2) SQLAlchemy 2.0 models (async-friendly)
+from __future__ import annotations
+
+import enum
+import uuid
+from datetime import datetime
+from typing import Optional, Any
+
+from sqlalchemy import (
+    String, Text, Boolean, Integer, ForeignKey, DateTime, Enum, UniqueConstraint, Index
+)
+from sqlalchemy.dialects.postgresql import UUID, JSONB
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+from sqlalchemy.sql import func
+
+# pgvector SQLAlchemy integration
+from pgvector.sqlalchemy import Vector
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+class KBDocStatus(str, enum.Enum):
+    DRAFT = "DRAFT"
+    PUBLISHED = "PUBLISHED"
+    ARCHIVED = "ARCHIVED"
+
+
+class KBDocType(str, enum.Enum):
+    MENU_CARD = "MENU_CARD"
+    CHEF_NOTES = "CHEF_NOTES"
+    ALLERGEN_SHEET = "ALLERGEN_SHEET"
+    FAQ = "FAQ"
+    GLOSSARY = "GLOSSARY"
+
+
+class KBSection(str, enum.Enum):
+    TITLE = "TITLE"
+    DESCRIPTION = "DESCRIPTION"
+    INGREDIENTS = "INGREDIENTS"
+    ALLERGENS = "ALLERGENS"
+    TRACES = "TRACES"
+    TECHNIQUE = "TECHNIQUE"
+    SUBSTITUTIONS = "SUBSTITUTIONS"
+    PAIRING = "PAIRING"
+    FAQ = "FAQ"
+    GLOSSARY = "GLOSSARY"
+
+
+class RagIntent(str, enum.Enum):
+    ALLERGENS = "ALLERGENS"
+    INGREDIENTS = "INGREDIENTS"
+    DIETARY = "DIETARY"
+    RECOMMENDATION = "RECOMMENDATION"
+    GLOSSARY = "GLOSSARY"
+    GENERAL = "GENERAL"
+    AVAILABILITY = "AVAILABILITY"
+    UNKNOWN = "UNKNOWN"
+
+
+class RagDecision(str, enum.Enum):
+    ANSWER = "ANSWER"
+    SOFT_DISCLAIMER = "SOFT_DISCLAIMER"
+    DISCLAIMER = "DISCLAIMER"
+    ASK_CLARIFY = "ASK_CLARIFY"
+
+
+class RagRisk(str, enum.Enum):
+    LOW = "LOW"
+    MEDIUM = "MEDIUM"
+    HIGH = "HIGH"
+    CRITICAL = "CRITICAL"
+
+
+class Tenant(Base):
+    __tablename__ = "tenant"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    name: Mapped[str] = mapped_column(String, nullable=False)
+    slug: Mapped[str] = mapped_column(String, nullable=False, unique=True)
+    settings_json: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    branches: Mapped[list["Branch"]] = relationship(back_populates="tenant")
+
+
+class Branch(Base):
+    __tablename__ = "branch"
+    __table_args__ = (UniqueConstraint("tenant_id", "slug", name="uq_branch_tenant_slug"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("tenant.id", ondelete="CASCADE"), nullable=False)
+    name: Mapped[str] = mapped_column(String, nullable=False)
+    slug: Mapped[str] = mapped_column(String, nullable=False)
+    timezone: Mapped[str] = mapped_column(String, nullable=False, default="America/Argentina/Mendoza")
+    address: Mapped[Optional[str]] = mapped_column(String)
+    settings_json: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    tenant: Mapped["Tenant"] = relationship(back_populates="branches")
+
+
+class Dish(Base):
+    __tablename__ = "dish"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "branch_id", "name", name="uq_dish_scope_name"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("tenant.id", ondelete="CASCADE"), nullable=False)
+    branch_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("branch.id", ondelete="CASCADE"), nullable=False)
+
+    code: Mapped[Optional[str]] = mapped_column(String)
+    name: Mapped[str] = mapped_column(String, nullable=False)
+    description: Mapped[Optional[str]] = mapped_column(Text)
+    tags_json: Mapped[list[Any]] = mapped_column(JSONB, nullable=False, default=list)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+
+class KBDocument(Base):
+    __tablename__ = "kb_document"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "branch_id", "type", "title", "version", name="uq_kb_doc_version"),
+        Index("ix_kb_document_scope_status", "tenant_id", "branch_id", "status", "effective_from", "effective_to"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("tenant.id", ondelete="CASCADE"), nullable=False)
+    branch_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("branch.id", ondelete="CASCADE"), nullable=False)
+
+    type: Mapped[KBDocType] = mapped_column(Enum(KBDocType, name="kb_doc_type"), nullable=False)
+    title: Mapped[str] = mapped_column(String, nullable=False)
+    source_uri: Mapped[Optional[str]] = mapped_column(String)
+    source_hash: Mapped[Optional[str]] = mapped_column(String)
+    status: Mapped[KBDocStatus] = mapped_column(Enum(KBDocStatus, name="kb_doc_status"), nullable=False, default=KBDocStatus.DRAFT)
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    effective_from: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    effective_to: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    chunks: Mapped[list["KBChunk"]] = relationship(back_populates="document", cascade="all, delete-orphan")
+
+
+class KBChunk(Base):
+    __tablename__ = "kb_chunk"
+    __table_args__ = (
+        Index("ix_kb_chunk_scope_doc", "tenant_id", "branch_id", "document_id", "section"),
+        Index("ix_kb_chunk_dish", "dish_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("tenant.id", ondelete="CASCADE"), nullable=False)
+    branch_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("branch.id", ondelete="CASCADE"), nullable=False)
+
+    document_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("kb_document.id", ondelete="CASCADE"), nullable=False)
+    dish_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), ForeignKey("dish.id", ondelete="SET NULL"))
+
+    section: Mapped[KBSection] = mapped_column(Enum(KBSection, name="kb_section"), nullable=False)
+    lang: Mapped[str] = mapped_column(String, nullable=False, default="es")
+    text: Mapped[str] = mapped_column(Text, nullable=False)
+    tokens_est: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    document: Mapped["KBDocument"] = relationship(back_populates="chunks")
+    embedding: Mapped[Optional["KBEmbedding"]] = relationship(back_populates="chunk", uselist=False, cascade="all, delete-orphan")
+
+
+class KBEmbedding(Base):
+    __tablename__ = "kb_embedding"
+    # embedding vector(1536) en DDL. Acá también.
+    chunk_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("kb_chunk.id", ondelete="CASCADE"), primary_key=True)
+
+    tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("tenant.id", ondelete="CASCADE"), nullable=False)
+    branch_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("branch.id", ondelete="CASCADE"), nullable=False)
+
+    model: Mapped[str] = mapped_column(String, nullable=False)
+    dim: Mapped[int] = mapped_column(Integer, nullable=False)
+    embedding: Mapped[list[float]] = mapped_column(Vector(1536), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    chunk: Mapped["KBChunk"] = relationship(back_populates="embedding")
+
+
+class ChatTurn(Base):
+    __tablename__ = "chat_turn"
+    __table_args__ = (Index("ix_chat_turn_scope_session", "tenant_id", "branch_id", "session_id", "created_at"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("tenant.id", ondelete="CASCADE"), nullable=False)
+    branch_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("branch.id", ondelete="CASCADE"), nullable=False)
+
+    session_id: Mapped[str] = mapped_column(String, nullable=False)
+    actor_role: Mapped[str] = mapped_column(String, nullable=False, default="customer")
+    user_text: Mapped[str] = mapped_column(Text, nullable=False)
+    normalized_text: Mapped[str] = mapped_column(Text, nullable=False)
+    intent: Mapped[RagIntent] = mapped_column(Enum(RagIntent, name="rag_intent"), nullable=False, default=RagIntent.UNKNOWN)
+    risk_level: Mapped[RagRisk] = mapped_column(Enum(RagRisk, name="rag_risk"), nullable=False, default=RagRisk.LOW)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    trace: Mapped[Optional["RagTrace"]] = relationship(back_populates="turn", uselist=False, cascade="all, delete-orphan")
+
+
+class RagTrace(Base):
+    __tablename__ = "rag_trace"
+    __table_args__ = (Index("ix_rag_trace_turn", "chat_turn_id"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    chat_turn_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("chat_turn.id", ondelete="CASCADE"), nullable=False)
+
+    tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("tenant.id", ondelete="CASCADE"), nullable=False)
+    branch_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("branch.id", ondelete="CASCADE"), nullable=False)
+
+    policy_id: Mapped[str] = mapped_column(String, nullable=False)
+    retrieval_k: Mapped[int] = mapped_column(Integer, nullable=False, default=8)
+    candidates_json: Mapped[list[Any]] = mapped_column(JSONB, nullable=False, default=list)
+    selected_json: Mapped[list[Any]] = mapped_column(JSONB, nullable=False, default=list)
+    final_score: Mapped[float] = mapped_column(nullable=False, default=0.0)
+    decision: Mapped[RagDecision] = mapped_column(Enum(RagDecision, name="rag_decision"), nullable=False)
+    answer_json: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    turn: Mapped["ChatTurn"] = relationship(back_populates="trace")
+________________________________________
+3) Pydantic schemas (AnswerEnvelope + requests)
+from __future__ import annotations
+
+from typing import Any, Optional, Literal
+from pydantic import BaseModel, Field
+
+
+Decision = Literal["ANSWER", "SOFT_DISCLAIMER", "DISCLAIMER", "ASK_CLARIFY"]
+Risk = Literal["LOW", "MEDIUM", "HIGH", "CRITICAL"]
+Intent = Literal["ALLERGENS", "INGREDIENTS", "DIETARY", "RECOMMENDATION", "GLOSSARY", "GENERAL", "AVAILABILITY", "UNKNOWN"]
+Action = Literal["SAFE_TO_ORDER", "VERIFY_WITH_STAFF", "ASK_FOR_DISH", "NONE"]
+
+
+class RagQueryIn(BaseModel):
+    tenant_slug: str
+    branch_slug: str
+    session_id: str
+    user_text: str
+    actor_role: str = "customer"
+
+
+class DishRef(BaseModel):
+    id: str
+    name: str
+    confidence: float
+
+
+class SourceRef(BaseModel):
+    chunk_id: str
+    section: str
+    score: float
+
+
+class AllergensBlock(BaseModel):
+    explicit: list[str] = Field(default_factory=list)
+    may_contain: list[str] = Field(default_factory=list)
+    unknown: list[str] = Field(default_factory=list)
+
+
+class PolicyInfo(BaseModel):
+    id: str
+    threshold: float
+
+
+class AnswerEnvelope(BaseModel):
+    decision: Decision
+    intent: Intent
+    risk_level: Risk
+    dish: Optional[DishRef] = None
+    answer_text: str
+    allergens: Optional[AllergensBlock] = None
+    uncertainties: list[str] = Field(default_factory=list)
+    action: Action = "NONE"
+    sources: list[SourceRef] = Field(default_factory=list)
+    policy: PolicyInfo
+    debug: Optional[dict[str, Any]] = None  # en prod podés apagarlo
+________________________________________
+4) Servicios V2: policy + intent + chunking + retrieval
+4.1 Policy (umbrales por intención)
+from dataclasses import dataclass
+
+@dataclass(frozen=True)
+class Policy:
+    policy_id: str = "rag-policy-v2"
+    k: int = 8
+
+    # umbrales por intención
+    thresholds = {
+        "ALLERGENS": 0.85,
+        "DIETARY": 0.75,
+        "INGREDIENTS": 0.72,
+        "RECOMMENDATION": 0.60,
+        "GLOSSARY": 0.65,
+        "GENERAL": 0.65,
+        "AVAILABILITY": 1.0,
+        "UNKNOWN": 0.75,
+    }
+
+    # secciones preferidas por intención (para re-rank)
+    preferred_sections = {
+        "ALLERGENS": {"ALLERGENS", "TRACES", "INGREDIENTS"},
+        "DIETARY": {"ALLERGENS", "TRACES", "INGREDIENTS", "DESCRIPTION"},
+        "INGREDIENTS": {"INGREDIENTS", "ALLERGENS", "TRACES", "DESCRIPTION"},
+        "RECOMMENDATION": {"DESCRIPTION", "PAIRING", "TECHNIQUE"},
+        "GLOSSARY": {"GLOSSARY", "DESCRIPTION"},
+        "GENERAL": {"TITLE", "DESCRIPTION"},
+        "UNKNOWN": {"DESCRIPTION"},
+    }
+
+    # alérgenos/triggers (mínimo)
+    allergen_terms = {
+        "gluten", "trigo", "cebada", "centeno", "avena",
+        "maní", "cacahuate", "nuez", "almendra", "avellana",
+        "mariscos", "crustáceos", "pescado", "huevo", "leche", "lactosa",
+        "soja", "sésamo", "mostaza"
+    }
+
+    def threshold_for(self, intent: str) -> float:
+        return float(self.thresholds.get(intent, 0.75))
+4.2 Normalización + Intent (heurística simple, reemplazable por LLM)
+En producción, esto lo podés mejorar con un “gatekeeper agent”, pero arrancá así.
+import re
+
+def normalize(text: str) -> str:
+    t = text.strip().lower()
+    t = re.sub(r"\s+", " ", t)
+    return t
+
+def detect_intent(norm: str, policy: Policy) -> str:
+    if any(term in norm for term in policy.allergen_terms) or "sin tacc" in norm or "celiac" in norm:
+        return "ALLERGENS"
+    if any(w in norm for w in ["ingrediente", "lleva", "tiene", "contiene", "salsa", "caldo"]):
+        return "INGREDIENTS"
+    if any(w in norm for w in ["vegano", "vegetar", "keto", "sin azúcar", "sin lactosa"]):
+        return "DIETARY"
+    if any(w in norm for w in ["recomenda", "liviano", "fresco", "picante", "para compartir", "maridaje"]):
+        return "RECOMMENDATION"
+    if any(w in norm for w in ["qué es", "que es", "significa", "glamoroso", "nombre raro"]):
+        return "GLOSSARY"
+    if any(w in norm for w in ["hay", "queda", "disponible", "stock", "tienen"]):
+        return "AVAILABILITY"
+    return "GENERAL"
+4.3 Chunking semántico (backoffice)
+Para producción, el chunking semántico suele salir de “fichas” estructuradas (CSV/JSON) o extracción de PDF + parsing. Acá te dejo un chunker simple por secciones esperadas en texto:
+from typing import Iterable, Tuple
+
+def semantic_chunk_sections(raw: str) -> list[Tuple[str, str]]:
+    """
+    Devuelve lista de (section, text). Espera etiquetas tipo:
+    INGREDIENTES:, ALERGENOS:, TRAZAS:, etc.
+    """
+    # mapeos de encabezados a secciones
+    headers = {
+        "ingredientes": "INGREDIENTS",
+        "alergenos": "ALLERGENS",
+        "alérgenos": "ALLERGENS",
+        "trazas": "TRACES",
+        "tecnica": "TECHNIQUE",
+        "técnica": "TECHNIQUE",
+        "sustituciones": "SUBSTITUTIONS",
+        "maridaje": "PAIRING",
+        "descripcion": "DESCRIPTION",
+        "descripción": "DESCRIPTION",
+        "glosario": "GLOSSARY",
+        "faq": "FAQ",
+    }
+
+    lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+    out: list[Tuple[str, str]] = []
+    current_section = "DESCRIPTION"
+    buff: list[str] = []
+
+    def flush():
+        nonlocal buff
+        if buff:
+            out.append((current_section, "\n".join(buff).strip()))
+            buff = []
+
+    for ln in lines:
+        m = re.match(r"^([A-Za-zÁÉÍÓÚáéíóúñÑ ]{3,}):\s*(.*)$", ln)
+        if m:
+            head = m.group(1).strip().lower()
+            if head in headers:
+                flush()
+                current_section = headers[head]
+                rest = m.group(2).strip()
+                if rest:
+                    buff.append(rest)
+                continue
+        buff.append(ln)
+
+    flush()
+    return out
+________________________________________
+5) Repositorio de retrieval (pgvector + filtros + re-rank)
+5.1 Query pgvector con cosine distance
+SQLAlchemy con pgvector.sqlalchemy permite usar KBEmbedding.embedding.cosine_distance(vec).
+from sqlalchemy import select, and_, or_
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.sql import func
+from datetime import datetime, timezone
+
+from models import KBEmbedding, KBChunk, KBDocument
+
+class RagRepository:
+    def __init__(self, session: AsyncSession):
+        self.session = session
+
+    async def search_chunks(
+        self,
+        tenant_id,
+        branch_id,
+        model_name: str,
+        query_vec: list[float],
+        k: int,
+        intent: str,
+        dish_id=None,
+    ):
+        now = datetime.now(timezone.utc)
+
+        # cosine_distance: menor = mejor
+        dist = KBEmbedding.embedding.cosine_distance(query_vec)
+
+        stmt = (
+            select(
+                KBChunk.id.label("chunk_id"),
+                KBChunk.section.label("section"),
+                KBChunk.text.label("text"),
+                KBChunk.metadata_json.label("meta"),
+                KBDocument.status.label("doc_status"),
+                dist.label("distance"),
+            )
+            .join(KBEmbedding, KBEmbedding.chunk_id == KBChunk.id)
+            .join(KBDocument, KBDocument.id == KBChunk.document_id)
+            .where(
+                KBChunk.tenant_id == tenant_id,
+                KBChunk.branch_id == branch_id,
+                KBEmbedding.tenant_id == tenant_id,
+                KBEmbedding.branch_id == branch_id,
+                KBEmbedding.model == model_name,
+                KBDocument.status == "PUBLISHED",
+                KBDocument.effective_from <= now,
+                or_(KBDocument.effective_to.is_(None), KBDocument.effective_to > now),
+            )
+            .order_by(dist.asc())
+            .limit(k)
+        )
+
+        if dish_id is not None:
+            stmt = stmt.where(KBChunk.dish_id == dish_id)
+
+        rows = (await self.session.execute(stmt)).mappings().all()
+
+        # Convertir distancia a score base (1 - dist), acotado
+        candidates = []
+        for r in rows:
+            base_score = max(0.0, 1.0 - float(r["distance"]))
+            candidates.append({
+                "chunk_id": str(r["chunk_id"]),
+                "section": str(r["section"]),
+                "text": r["text"],
+                "meta": r["meta"] or {},
+                "base_score": base_score,
+            })
+
+        # Re-rank por reglas
+        preferred = Policy.preferred_sections.get(intent, set())
+        def rule_bonus(c):
+            bonus = 0.0
+            if c["section"] in preferred:
+                bonus += 0.08
+            # si el chunk declara alérgenos explícitos y estamos en ALLERGENS/DIETARY
+            if intent in ("ALLERGENS", "DIETARY", "INGREDIENTS"):
+                allergens = set((c["meta"] or {}).get("allergens_explicit", []))
+                # bonus por tener al menos algo declarado
+                if allergens:
+                    bonus += 0.05
+            return bonus
+
+        for c in candidates:
+            c["final_score"] = min(1.0, c["base_score"] * 0.7 + rule_bonus(c) * 0.3)
+
+        candidates.sort(key=lambda x: x["final_score"], reverse=True)
+
+        return candidates
+________________________________________
+6) Embeddings provider (stub realista)
+En producción:
+•	si usás OpenAI/Claude/otros: llamás API
+•	si usás local (Ollama + nomic-embed-text): HTTP local
+Acá te dejo un stub (para que compiles) y vos lo conectás.
+class EmbeddingsProvider:
+    def __init__(self, dim: int = 1536):
+        self.dim = dim
+
+    async def embed(self, text: str) -> list[float]:
+        # TODO: reemplazar por tu proveedor real
+        # Debe devolver list[float] de longitud self.dim
+        raise NotImplementedError("Conectar proveedor real de embeddings")
+________________________________________
+7) RagService (orquestación V2 + trazabilidad)
+import uuid
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
+
+from models import Tenant, Branch, ChatTurn, RagTrace
+from schemas import AnswerEnvelope, PolicyInfo, SourceRef, AllergensBlock, DishRef
+
+class RagService:
+    def __init__(self, db: AsyncSession, repo: RagRepository, embedder: EmbeddingsProvider, policy: Policy):
+        self.db = db
+        self.repo = repo
+        self.embedder = embedder
+        self.policy = policy
+
+    async def resolve_scope(self, tenant_slug: str, branch_slug: str):
+        t = (await self.db.execute(select(Tenant).where(Tenant.slug == tenant_slug))).scalar_one()
+        b = (await self.db.execute(
+            select(Branch).where(Branch.tenant_id == t.id, Branch.slug == branch_slug)
+        )).scalar_one()
+        return t, b
+
+    async def query(self, tenant_slug: str, branch_slug: str, session_id: str, user_text: str, actor_role: str) -> AnswerEnvelope:
+        tenant, branch = await self.resolve_scope(tenant_slug, branch_slug)
+
+        norm = normalize(user_text)
+        intent = detect_intent(norm, self.policy)
+
+        # AVAILABILITY no va por RAG
+        if intent == "AVAILABILITY":
+            return AnswerEnvelope(
+                decision="DISCLAIMER",
+                intent=intent,
+                risk_level="MEDIUM",
+                answer_text="La disponibilidad y tiempos de cocina se confirman con el personal o el sistema de pedidos (no por el asistente de carta).",
+                action="VERIFY_WITH_STAFF",
+                policy=PolicyInfo(id=self.policy.policy_id, threshold=self.policy.threshold_for(intent)),
+            )
+
+        # riesgo base
+        risk = "LOW"
+        if intent == "ALLERGENS":
+            risk = "CRITICAL"
+        elif intent in ("DIETARY", "INGREDIENTS"):
+            risk = "HIGH"
+
+        # guardar chat_turn
+        turn = ChatTurn(
+            tenant_id=tenant.id,
+            branch_id=branch.id,
+            session_id=session_id,
+            actor_role=actor_role,
+            user_text=user_text,
+            normalized_text=norm,
+            intent=intent,
+            risk_level=risk,
+        )
+        self.db.add(turn)
+        await self.db.flush()  # genera turn.id
+
+        # embeddings
+        qvec = await self.embedder.embed(norm)
+
+        candidates = await self.repo.search_chunks(
+            tenant_id=tenant.id,
+            branch_id=branch.id,
+            model_name="embed-model-v1",
+            query_vec=qvec,
+            k=self.policy.k,
+            intent=intent,
+            dish_id=None,  # en V2 avanzada: primero resolver plato, luego dish_id
+        )
+
+        threshold = self.policy.threshold_for(intent)
+        top = candidates[0] if candidates else None
+        top_score = float(top["final_score"]) if top else 0.0
+
+        # decisión
+        decision = "ANSWER"
+        action = "NONE"
+        uncertainties: list[str] = []
+        allergens_block = None
+
+        if not top or top_score < threshold:
+            # para ALLERGENS: no inventar
+            if intent == "ALLERGENS":
+                decision = "DISCLAIMER"
+                action = "VERIFY_WITH_STAFF"
+                uncertainties.append("No hay evidencia suficiente en la carta para confirmar con seguridad.")
+                answer_text = "No puedo confirmarlo con seguridad solo con la información disponible. Consultá al mozo/cocina por alérgenos y posible contaminación cruzada."
+            else:
+                decision = "SOFT_DISCLAIMER"
+                action = "NONE"
+                uncertainties.append("La evidencia encontrada es limitada.")
+                answer_text = "Puedo darte una orientación general, pero no encontré evidencia concluyente en la carta. ¿Podés decirme el nombre exacto del plato o qué ingrediente te preocupa?"
+        else:
+            # Construcción de respuesta segura y “mínima”
+            # (En producción: acá llamás LLM para redacción, pero con JSON + guardrails)
+            srcs = candidates[:3]
+            answer_text = build_safe_answer(intent, norm, srcs)
+
+            # Alérgenos: inferir desde metadata si existe
+            if intent in ("ALLERGENS", "DIETARY", "INGREDIENTS"):
+                explicit = []
+                may = []
+                unknown = []
+                for c in srcs:
+                    meta = c.get("meta") or {}
+                    explicit += meta.get("allergens_explicit", [])
+                    may += meta.get("contains_may_contain", [])
+                # de-dup
+                explicit = sorted(set(explicit))
+                may = sorted(set(may))
+                allergens_block = AllergensBlock(explicit=explicit, may_contain=may, unknown=unknown)
+
+                if intent == "ALLERGENS" and (not explicit and not may):
+                    # aunque score sea alto, si no hay declaración explícita: conservador
+                    decision = "SOFT_DISCLAIMER"
+                    action = "VERIFY_WITH_STAFF"
+                    uncertainties.append("No hay declaración explícita de alérgenos/trazas en la evidencia recuperada.")
+
+        # sources
+        sources = []
+        for c in (candidates[:3] if candidates else []):
+            sources.append(SourceRef(chunk_id=c["chunk_id"], section=c["section"], score=float(c["final_score"])))
+
+        envelope = AnswerEnvelope(
+            decision=decision,
+            intent=intent,
+            risk_level=risk,
+            dish=None,  # (V2 avanzada: resolver dish)
+            answer_text=answer_text,
+            allergens=allergens_block,
+            uncertainties=uncertainties,
+            action=action,
+            sources=sources,
+            policy=PolicyInfo(id=self.policy.policy_id, threshold=threshold),
+        )
+
+        # guardar trace
+        trace = RagTrace(
+            chat_turn_id=turn.id,
+            tenant_id=tenant.id,
+            branch_id=branch.id,
+            policy_id=self.policy.policy_id,
+            retrieval_k=self.policy.k,
+            candidates_json=[{
+                "chunk_id": c["chunk_id"],
+                "section": c["section"],
+                "base_score": c["base_score"],
+                "final_score": c["final_score"]
+            } for c in candidates],
+            selected_json=[s.model_dump() for s in sources],
+            final_score=top_score,
+            decision=decision,
+            answer_json=envelope.model_dump(),
+        )
+        self.db.add(trace)
+
+        await self.db.commit()
+        return envelope
+
+
+def build_safe_answer(intent: str, norm: str, srcs: list[dict]) -> str:
+    # versión “sin LLM” (compila, segura). Luego la reemplazás por LLM + JSON.
+    if not srcs:
+        return "No encontré información suficiente en la carta."
+    if intent == "RECOMMENDATION":
+        return "Según la carta, estas opciones podrían encajar con lo que pedís. Si me decís si preferís carne/pescado/veg, lo ajusto mejor."
+    if intent == "GLOSSARY":
+        return "Te lo traduzco a simple: es una descripción del plato y su preparación. Si querés, decime cuál plato y te lo explico paso a paso."
+    # GENERAL / INGREDIENTS / ALLERGENS / DIETARY: citar evidencia mínima
+    snippet = srcs[0]["text"]
+    snippet = snippet[:280].strip()
+    return f"Según la carta: {snippet}…"
+________________________________________
+8) FastAPI endpoints reales (admin + query)
+8.1 DB session async (ejemplo)
+from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
+
+DATABASE_URL = "postgresql+asyncpg://user:pass@localhost:5432/app"
+
+engine = create_async_engine(DATABASE_URL, pool_pre_ping=True)
+SessionLocal = async_sessionmaker(engine, expire_on_commit=False)
+
+async def get_db() -> AsyncSession:
+    async with SessionLocal() as session:
+        yield session
+8.2 API
+from fastapi import FastAPI, Depends, HTTPException
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
+
+from schemas import RagQueryIn, AnswerEnvelope
+from models import KBDocument, KBDocStatus
+# from services import RagService, RagRepository, EmbeddingsProvider, Policy
+
+app = FastAPI(title="RAG Restaurante V2")
+
+policy = Policy()
+embedder = EmbeddingsProvider(dim=1536)  # conectar real
+# repo y service se instancian por request para usar la sesión
+
+
+@app.post("/v2/rag/query", response_model=AnswerEnvelope)
+async def rag_query(payload: RagQueryIn, db: AsyncSession = Depends(get_db)):
+    repo = RagRepository(db)
+    service = RagService(db=db, repo=repo, embedder=embedder, policy=policy)
+    try:
+        return await service.query(
+            tenant_slug=payload.tenant_slug,
+            branch_slug=payload.branch_slug,
+            session_id=payload.session_id,
+            user_text=payload.user_text,
+            actor_role=payload.actor_role,
+        )
+    except Exception as e:
+        # en prod: log
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ---------- ADMIN KB (mínimo) ----------
+
+from pydantic import BaseModel
+from datetime import datetime
+
+class KBDocumentCreateIn(BaseModel):
+    tenant_id: str
+    branch_id: str
+    type: str
+    title: str
+    source_uri: str | None = None
+    effective_from: datetime | None = None
+    effective_to: datetime | None = None
+
+@app.post("/v2/admin/kb/documents")
+async def create_kb_document(payload: KBDocumentCreateIn, db: AsyncSession = Depends(get_db)):
+    doc = KBDocument(
+        tenant_id=payload.tenant_id,
+        branch_id=payload.branch_id,
+        type=payload.type,
+        title=payload.title,
+        source_uri=payload.source_uri,
+        status=KBDocStatus.DRAFT,
+        version=1,
+        effective_from=payload.effective_from or datetime.utcnow(),
+        effective_to=payload.effective_to,
+    )
+    db.add(doc)
+    await db.commit()
+    return {"id": str(doc.id), "status": doc.status}
+
+@app.post("/v2/admin/kb/documents/{doc_id}/publish")
+async def publish_kb_document(doc_id: str, db: AsyncSession = Depends(get_db)):
+    doc = (await db.execute(select(KBDocument).where(KBDocument.id == doc_id))).scalar_one_or_none()
+    if not doc:
+        raise HTTPException(404, "document not found")
+    doc.status = KBDocStatus.PUBLISHED
+    await db.commit()
+    return {"id": str(doc.id), "status": doc.status}
+________________________________________
+9) Ingesta V2 (documento → chunks → embeddings) endpoint “real”
+Esto requiere:
+1.	obtener texto del documento (PDF/Markdown/etc.) → extractor (lo conectás)
+2.	semantic_chunk_sections
+3.	insertar KBChunk
+4.	generar embedding por chunk y guardar KBEmbedding
+from sqlalchemy import select
+from fastapi import UploadFile, File
+
+class IngestService:
+    def __init__(self, db: AsyncSession, embedder: EmbeddingsProvider):
+        self.db = db
+        self.embedder = embedder
+
+    async def ingest_document_text(self, doc: KBDocument, raw_text: str, model_name="embed-model-v1"):
+        chunks = semantic_chunk_sections(raw_text)
+
+        created = []
+        for section, text in chunks:
+            kb = KBChunk(
+                tenant_id=doc.tenant_id,
+                branch_id=doc.branch_id,
+                document_id=doc.id,
+                dish_id=None,
+                section=section,
+                lang="es",
+                text=text,
+                tokens_est=max(1, len(text) // 4),
+                metadata_json={},  # acá podés pre-extraer alérgenos si tenés parser
+            )
+            self.db.add(kb)
+            await self.db.flush()
+
+            vec = await self.embedder.embed(text)
+            emb = KBEmbedding(
+                chunk_id=kb.id,
+                tenant_id=doc.tenant_id,
+                branch_id=doc.branch_id,
+                model=model_name,
+                dim=len(vec),
+                embedding=vec,
+            )
+            self.db.add(emb)
+            created.append(str(kb.id))
+
+        await self.db.commit()
+        return {"chunks_created": len(created), "chunk_ids": created}
+
+
+@app.post("/v2/admin/kb/documents/{doc_id}/ingest")
+async def ingest_kb_document(doc_id: str, db: AsyncSession = Depends(get_db)):
+    doc = (await db.execute(select(KBDocument).where(KBDocument.id == doc_id))).scalar_one_or_none()
+    if not doc:
+        raise HTTPException(404, "document not found")
+    if doc.status != KBDocStatus.PUBLISHED:
+        raise HTTPException(400, "document must be PUBLISHED to ingest")
+
+    # TODO: extraer texto real desde doc.source_uri o storage
+    # Por ahora, ejemplo placeholder:
+    raw_text = f"DESCRIPCION: {doc.title}\nINGREDIENTES: ...\nALERGENOS: ...\nTRAZAS: ..."
+
+    svc = IngestService(db, embedder)
+    return await svc.ingest_document_text(doc, raw_text)
+________________________________________
+10) Qué te falta enchufar (solo 2 piezas) para que esto corra de verdad
+1.	EmbeddingsProvider.embed()
+o	conectar OpenAI/Claude/local.
+o	tiene que devolver list[float] de dimensión fija.
+2.	Extractor de documentos (PDF → texto + secciones)
+o	si los docentes/chef suben PDF, necesitás parsing.
+o	si podés cambiar el proceso: mejor que suban una “ficha estructurada” (JSON/CSV) y el PDF sea opcional.
+________________________________________
+11) Próximo salto (V2.1 recomendado, si tu UX lo necesita)
+•	dish/resolve para identificar plato con alta confianza y pedir confirmación.
+•	metadata_json enriquecido: allergens_explicit, contains_may_contain, dietary_tags.
+•	“Hard guardrail”: en ALLERGENS, si no hay ALLERGENS/TRACES del plato → siempre VERIFY.
+________________________________________
+Si me decís qué proveedor de embeddings vas a usar (OpenAI / Ollama / otro) y dimensión, te lo dejo ya conectado (código real), y también te agrego el endpoint dish/resolve con sugerencias de platos por similitud.
+Ollama
+Perfecto: con Ollama te dejo el EmbeddingsProvider real (async) y listo para usar con tu V2. También te marco los puntos de “producción” (timeouts, retries, healthcheck, cache).
+Voy a asumir que vas a usar nomic-embed-text (muy común) o mxbai-embed-large. Si elegís otro, solo cambiás el nombre del modelo.
+________________________________________
+1) Requisitos
+1.	Ollama corriendo (local o en servidor):
+ollama serve
+2.	Descargar el modelo de embeddings:
+ollama pull nomic-embed-text
+# o
+ollama pull mxbai-embed-large
+3.	Endpoint por defecto de Ollama:
+•	http://localhost:11434
+________________________________________
+2) EmbeddingsProvider para Ollama (async, producción)
+from __future__ import annotations
+
+import asyncio
+from dataclasses import dataclass
+from typing import Optional, List
+
+import httpx
+
+
+@dataclass
+class OllamaEmbeddingsProvider:
+    base_url: str = "http://localhost:11434"
+    model: str = "nomic-embed-text"
+    timeout_s: float = 10.0
+    max_retries: int = 2
+
+    async def embed(self, text: str) -> List[float]:
+        """
+        Devuelve embedding como list[float] usando Ollama /api/embeddings.
+        Producción:
+          - timeout
+          - retries con backoff
+          - valida respuesta
+        """
+        # Ollama a veces responde mejor si el input no es enorme
+        text = (text or "").strip()
+        if not text:
+            raise ValueError("embed(): text vacío")
+
+        url = f"{self.base_url}/api/embeddings"
+        payload = {"model": self.model, "prompt": text}
+
+        last_exc: Optional[Exception] = None
+        for attempt in range(self.max_retries + 1):
+            try:
+                async with httpx.AsyncClient(timeout=self.timeout_s) as client:
+                    r = await client.post(url, json=payload)
+                    r.raise_for_status()
+                    data = r.json()
+
+                emb = data.get("embedding")
+                if not isinstance(emb, list) or not emb or not isinstance(emb[0], (int, float)):
+                    raise RuntimeError(f"Respuesta inválida de Ollama embeddings: {data}")
+
+                # normalizar a float
+                return [float(x) for x in emb]
+
+            except Exception as e:
+                last_exc = e
+                # backoff simple
+                if attempt < self.max_retries:
+                    await asyncio.sleep(0.25 * (2 ** attempt))
+                    continue
+                raise RuntimeError(f"Ollama embed falló tras {self.max_retries+1} intentos: {e}") from e
+
+        # nunca llega
+        raise RuntimeError(str(last_exc))
+Cómo lo enchufás en tu RagService
+Reemplazá:
+embedder = EmbeddingsProvider(dim=1536)
+por:
+embedder = OllamaEmbeddingsProvider(
+    base_url="http://localhost:11434",
+    model="nomic-embed-text",
+    timeout_s=10.0,
+    max_retries=2,
+)
+Nota: ahora no hace falta dim fijo. Igual conviene guardarlo en DB al insertar embeddings (dim=len(vec)), como ya hicimos.
+________________________________________
+3) Healthcheck de Ollama (para tu monitoring)
+import httpx
+from fastapi import APIRouter, HTTPException
+
+router = APIRouter()
+
+@router.get("/v2/admin/ollama/health")
+async def ollama_health():
+    try:
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            r = await client.get("http://localhost:11434/api/tags")
+            r.raise_for_status()
+            return {"ok": True, "models": r.json().get("models", [])}
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Ollama no disponible: {e}")
+________________________________________
+4) Importante para pgvector: la dimensión del vector
+En tu DDL puse vector(1536) por defecto. Con Ollama puede no ser 1536 (depende del modelo).
+Opción A (recomendada): usar vector sin dimensión fija
+En pgvector podés definir vector sin (n) para permitir cualquier dim:
+ALTER TABLE kb_embedding
+  ALTER COLUMN embedding TYPE vector;
+Y en SQLAlchemy:
+embedding: Mapped[list[float]] = mapped_column(Vector(), nullable=False)
+✅ Esto te evita dolores si cambiás de modelo.
+Opción B: fijar dimensión según modelo
+Si elegís 1 modelo y te quedás ahí, medí len(vec) una vez y fijá el DDL a esa dimensión.
+________________________________________
+5) Pequeña mejora “pro”: cache de embeddings (barato y útil)
+En RAG, las preguntas se repiten (“sin tacc”, “tiene maní”). Podés cachear por hash del texto normalizado.
+Ejemplo simple in-memory (después lo pasás a Redis):
+import hashlib
+
+class CachedEmbedder:
+    def __init__(self, inner: OllamaEmbeddingsProvider, max_items: int = 2000):
+        self.inner = inner
+        self.cache = {}
+        self.max_items = max_items
+
+    async def embed(self, text: str) -> list[float]:
+        key = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        if key in self.cache:
+            return self.cache[key]
+        vec = await self.inner.embed(text)
+        if len(self.cache) >= self.max_items:
+            # eviction naive
+            self.cache.pop(next(iter(self.cache)))
+        self.cache[key] = vec
+        return vec
+________________________________________
+6) Ajuste de tu endpoint de ingesta (para guardar dim real)
+En tu IngestService ya puse:
+dim=len(vec),
+embedding=vec
+Perfecto. Solo asegurate de que el tipo vector acepte esa dimensión (ver punto 4).
+________________________________________
+7) Conclusión operativa
+Con esto, tu V2 ya queda 100% compatible con Ollama:
+•	ingestion: chunk -> embed(text) -> kb_embedding
+•	query: embed(question) -> pgvector search -> re-rank -> policy -> AnswerEnvelope
+________________________________________
+Si querés, te dejo además (en el mismo estilo “listo para copiar”):
+•	docker-compose.yml con Postgres + pgvector + Ollama + tu FastAPI
+•	script de migración Alembic para pasar vector(1536) a vector (sin dim) sin romper datos
+•	endpoint /v2/rag/dish/resolve para identificar el plato antes del retrieval (sube muchísimo la calidad en restaurante).
+si
+Listo. Te dejo todo lo que faltaba para que tu V2 con Ollama + Postgres/pgvector + FastAPI quede “deployable”:
+1.	docker-compose.yml (Postgres+pgvector, Ollama, API)
+2.	Migración Alembic para cambiar vector(1536) → vector (sin dimensión)
+3.	Endpoint /v2/rag/dish/resolve (resolver plato primero) + uso desde /v2/rag/query
+________________________________________
+1) docker-compose.yml (Postgres + Ollama + API)
+Ajustá DATABASE_URL y la ruta del build de tu API.
+version: "3.9"
+
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    container_name: rag_db
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: app
+      POSTGRES_DB: rag
+    ports:
+      - "5432:5432"
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app -d rag"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: rag_ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:11434/api/tags >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: rag_api
+    environment:
+      DATABASE_URL: postgresql+asyncpg://app:app@db:5432/rag
+      OLLAMA_BASE_URL: http://ollama:11434
+      OLLAMA_EMBED_MODEL: nomic-embed-text
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+      ollama:
+        condition: service_healthy
+
+volumes:
+  db_data:
+  ollama_data:
+Dockerfile mínimo para FastAPI (si lo necesitás)
+FROM python:3.11-slim
+
+WORKDIR /app
+COPY pyproject.toml poetry.lock* requirements.txt* /app/
+
+# Elegí UNA estrategia de deps:
+# 1) requirements.txt
+RUN if [ -f requirements.txt ]; then pip install --no-cache-dir -r requirements.txt; fi
+
+COPY . /app
+
+EXPOSE 8000
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+Pull del modelo (una vez levantado)
+docker compose up -d
+curl http://localhost:11434/api/pull -d '{"name":"nomic-embed-text"}'
+________________________________________
+2) Alembic migration: vector(1536) → vector (sin dim)
+Esto te permite cambiar de modelo sin romper por dimensión.
+a) En el modelo SQLAlchemy
+from pgvector.sqlalchemy import Vector
+
+embedding: Mapped[list[float]] = mapped_column(Vector(), nullable=False)
+b) Migración Alembic (upgrade/downgrade)
+"""make_embedding_vector_dimless
+
+Revision ID: 20260108_01
+Revises: <TU_REVISION_ANTERIOR>
+Create Date: 2026-01-08
+"""
+
+from alembic import op
+
+revision = "20260108_01"
+down_revision = "<TU_REVISION_ANTERIOR>"
+branch_labels = None
+depends_on = None
+
+def upgrade():
+    # Cambia el tipo de la columna a vector sin dimensión
+    op.execute("ALTER TABLE kb_embedding ALTER COLUMN embedding TYPE vector;")
+
+def downgrade():
+    # Si querés volver a un tamaño fijo, elegí uno (ej. 1536)
+    op.execute("ALTER TABLE kb_embedding ALTER COLUMN embedding TYPE vector(1536);")
+Nota: si ya tenés datos con otra dimensión, el downgrade puede fallar. En prod suele ser “one-way”.
+________________________________________
+3) Dish resolve (endpoint + servicio) — mejora enorme en restaurante
+La idea: antes del retrieval de chunks, resolvés el plato candidato. Luego haces retrieval filtrando por dish_id y sube muchísimo el score.
+3.1 Endpoint: /v2/rag/dish/resolve
+from typing import Optional, List
+from pydantic import BaseModel
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
+
+from models import Tenant, Branch, Dish
+from services import normalize  # tu función
+
+router = APIRouter()
+
+class DishResolveIn(BaseModel):
+    tenant_slug: str
+    branch_slug: str
+    query: str
+    limit: int = 5
+
+class DishCandidate(BaseModel):
+    id: str
+    name: str
+    confidence: float
+
+class DishResolveOut(BaseModel):
+    candidates: List[DishCandidate]
+    hint: Optional[str] = None
+
+
+async def resolve_scope(db: AsyncSession, tenant_slug: str, branch_slug: str):
+    t = (await db.execute(select(Tenant).where(Tenant.slug == tenant_slug))).scalar_one_or_none()
+    if not t:
+        raise HTTPException(404, "tenant not found")
+    b = (await db.execute(select(Branch).where(Branch.tenant_id == t.id, Branch.slug == branch_slug))).scalar_one_or_none()
+    if not b:
+        raise HTTPException(404, "branch not found")
+    return t, b
+
+
+@router.post("/v2/rag/dish/resolve", response_model=DishResolveOut)
+async def dish_resolve(payload: DishResolveIn, db: AsyncSession = Depends(get_db)):
+    _, branch = await resolve_scope(db, payload.tenant_slug, payload.branch_slug)
+
+    q = normalize(payload.query)
+    # Resolver simple: ILIKE sobre nombre + ranking por "contiene"
+    # (V2.2: podés hacer embeddings de Dish.name/description)
+    stmt = (
+        select(Dish)
+        .where(Dish.branch_id == branch.id, Dish.is_active.is_(True))
+        .where(Dish.name.ilike(f"%{q}%"))
+        .limit(payload.limit)
+    )
+    rows = (await db.execute(stmt)).scalars().all()
+
+    cands = []
+    for d in rows:
+        # confidence heurística simple
+        name = d.name.lower()
+        conf = 0.65
+        if name == q:
+            conf = 0.95
+        elif q in name:
+            conf = 0.80
+        cands.append(DishCandidate(id=str(d.id), name=d.name, confidence=conf))
+
+    hint = None
+    if not cands:
+        hint = "No encontré un plato con ese nombre. Probá con una palabra clave (ej: 'burrata', 'trucha')."
+
+    return DishResolveOut(candidates=cands, hint=hint)
+Para restaurante, esto ya te da UX: “¿Te referís a Burrata… o Trucha…?” y recién ahí RAG.
+________________________________________
+4) Usar dish-resolve dentro de /v2/rag/query (producción)
+4.1 Mejoras mínimas en RagService.query()
+•	Si el intent es ALLERGENS/INGREDIENTS/DIETARY/GENERAL, intentás resolver plato.
+•	Si hay 2+ candidatos parecidos → ASK_CLARIFY y devolvés lista.
+•	Si hay 1 candidato fuerte → retrieval filtrando por dish_id.
+Acá tenés el parche clave (solo la parte relevante):
+async def try_resolve_dish(self, tenant_id, branch_id, norm: str):
+    # resolver por ILIKE (simple) - podés reemplazar por embeddings si querés
+    stmt = (
+        select(Dish)
+        .where(Dish.tenant_id == tenant_id, Dish.branch_id == branch_id, Dish.is_active.is_(True))
+        .where(Dish.name.ilike(f"%{norm}%"))
+        .limit(5)
+    )
+    dishes = (await self.db.execute(stmt)).scalars().all()
+    # scoring simple
+    scored = []
+    for d in dishes:
+        name = d.name.lower()
+        conf = 0.65
+        if name == norm:
+            conf = 0.95
+        elif norm in name:
+            conf = 0.80
+        scored.append((d, conf))
+    scored.sort(key=lambda x: x[1], reverse=True)
+    return scored
+
+
+async def query(...):
+    ...
+    # (1) resolver dish si aplica
+    dish_id = None
+    dish_ref = None
+
+    if intent in ("ALLERGENS","INGREDIENTS","DIETARY","GENERAL"):
+        scored = await self.try_resolve_dish(tenant.id, branch.id, norm)
+
+        if len(scored) >= 2 and (scored[0][1] - scored[1][1]) < 0.10:
+            # ambiguo -> ASK_CLARIFY
+            candidates = [{"id": str(d.id), "name": d.name, "confidence": conf} for d, conf in scored[:3]]
+            # guardá trace igualmente si querés, pero respuesta rápida:
+            return AnswerEnvelope(
+                decision="ASK_CLARIFY",
+                intent=intent,
+                risk_level=risk,
+                dish=None,
+                answer_text="¿A cuál plato te referís? Elegí uno de estos para responder con precisión.",
+                action="ASK_FOR_DISH",
+                sources=[],
+                uncertainties=[],
+                policy=PolicyInfo(id=self.policy.policy_id, threshold=threshold),
+                debug={"dish_candidates": candidates},
+            )
+
+        if scored and scored[0][1] >= 0.80:
+            dish_id = scored[0][0].id
+            dish_ref = DishRef(id=str(dish_id), name=scored[0][0].name, confidence=scored[0][1])
+
+    # (2) embeddings + retrieval filtrado por dish_id
+    qvec = await self.embedder.embed(norm)
+    candidates = await self.repo.search_chunks(
+        tenant_id=tenant.id,
+        branch_id=branch.id,
+        model_name="embed-model-v1",
+        query_vec=qvec,
+        k=self.policy.k,
+        intent=intent,
+        dish_id=dish_id,  # <-- clave
+    )
+
+    ...
+    envelope = AnswerEnvelope(
+        ...
+        dish=dish_ref,
+        ...
+    )
+________________________________________
+5) Ajuste recomendado al repo: fallback si dish_id no encuentra nada
+Si filtrás por dish_id y no hay chunks (ficha no ingerida), hacés fallback a búsqueda sin dish_id pero bajando confianza y forzando SOFT_DISCLAIMER o VERIFY.
+Idea simple:
+•	buscar con dish_id
+•	si 0 resultados: buscar global (branch) y setear uncertainty += "No hay ficha del plato publicada"
+________________________________________
+6) Integración con Ollama via env vars
+En tu OllamaEmbeddingsProvider leés env:
+import os
+
+embedder = OllamaEmbeddingsProvider(
+    base_url=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"),
+    model=os.getenv("OLLAMA_EMBED_MODEL", "nomic-embed-text"),
+)
+________________________________________
+7) Orden de ejecución “go live” (sin sorpresas)
+1.	docker compose up -d
+2.	alembic upgrade head (crea tablas + migración vector dimless si corresponde)
+3.	ollama pull nomic-embed-text
+4.	crear tenant + branch
+5.	cargar dish por sucursal
+6.	crear kb_document (PUBLISHED)
+7.	POST /v2/admin/kb/documents/{id}/ingest
+8.	probar POST /v2/rag/dish/resolve
+9.	probar POST /v2/rag/query

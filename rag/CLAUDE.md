@@ -57,6 +57,7 @@ Models Layer (src/models/)     → SQLAlchemy entities
 - **RetrievalService**: Semantic search + confidence-based decision routing (thresholds: 0.78 answer, 0.60 soft_disclaimer)
 - **OllamaService**: HTTP client for Ollama API with timeout handling
 - **TextService**: Text normalization, chunking (1200 chars, 200 overlap), allergy keyword detection
+- **PromptService**: Spanish-language prompt construction with allergen safety emphasis
 
 ### Decision Logic
 
@@ -73,6 +74,7 @@ All settings in `src/config/settings.py` (Pydantic Settings, loads from `.env`):
 |---------|---------|---------|
 | `DATABASE_URL` | `postgresql+psycopg://...@127.0.0.1:5434/menu_rag` | DB connection |
 | `OLLAMA_URL` | `http://localhost:11434` | Ollama endpoint |
+| `EMBED_MODEL` | `nomic-embed-text` | Embedding model (768-dim) |
 | `CHAT_MODEL` | `llama3.2:1b` | LLM for responses |
 | `confidence_answer_threshold` | `0.78` | High confidence cutoff |
 | `confidence_soft_threshold` | `0.60` | Medium confidence cutoff |
@@ -86,9 +88,29 @@ All settings in `src/config/settings.py` (Pydantic Settings, loads from `.env`):
 - **chat_turn**: Conversation history
 - **rag_trace**: Audit trail (used_chunk_ids, scores, decision)
 
+## API Endpoints
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/health` | System status (DB counts, Ollama reachability) |
+| GET | `/dishes` | List all active dishes |
+| POST | `/chat` | RAG query endpoint (question, optional dish_id, top_k) |
+| POST | `/seed` | Load sample dishes (idempotent) |
+| POST | `/index` | Generate embeddings for unindexed chunks |
+
 ## Development Notes
 
 - Port 5434 avoids conflicts with local Windows PostgreSQL
 - Chat endpoint has 300s timeout for large model inference
 - Allergy queries trigger conservative mode (see `ALLERGY_TRIGGERS` in `src/core/constants.py`)
 - Add new dishes via `data/seed_dishes.py` using `_dish_template()` function
+- All prompts and responses are in Spanish
+
+## V2 Roadmap
+
+See `optimizacion.md` for the detailed production evolution plan, including:
+- Multi-tenant/multi-branch architecture
+- Semantic chunking by sections (INGREDIENTS, ALLERGENS, TRACES, etc.)
+- Risk-based policies per intent type (0.85 threshold for allergens)
+- Structured JSON responses (AnswerEnvelope)
+- Document lifecycle management (DRAFT → PUBLISHED → ARCHIVED)
